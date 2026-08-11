@@ -118,8 +118,154 @@ $('newMemberBtn').onclick=()=>{$('memberForm').reset();$('memberId').value='';$(
 $('newActivityBtn').onclick=()=>{$('activityForm').reset();$('activityId').value='';$('activityDate').value=nowDate();$('activityDialog').showModal()} ;window.editActivity=async id=>{const a=await get('activities',id);$('activityId').value=a.id;$('activityName').value=a.name;$('activityDate').value=a.date;$('activityBudget').value=a.budget||0;$('activityDescription').value=a.description||'';$('activityDialog').showModal()} ;$('saveActivityBtn').onclick=async e=>{e.preventDefault();if(!$('activityForm').reportValidity())return;const id=$('activityId').value||uid('a'),d={id,name:$('activityName').value.trim(),date:$('activityDate').value,budget:+$('activityBudget').value||0,description:$('activityDescription').value.trim()};await put('activities',d);await audit($('activityId').value?'edit':'create','activity',id,d);$('activityDialog').close();await renderAll();toast('Actividad guardada')}
 async function closeMonth(){const month=prompt('Mes a cerrar (AAAA-MM):',ym());if(!month)return;if(await get('closures',month)){alert('Ese mes ya fue cerrado.');return}const alltx=await activeTx(),tx=alltx.filter(x=>ym(x.date)===month),t=totals(tx),bt=totals(alltx.filter(x=>x.date<`${month}-01`)),opening=bt.income-bt.expense,c={id:month,month,opening,income:t.income,expense:t.expense,sponsored:t.sponsored,closing:opening+t.income-t.expense,closedAt:new Date().toISOString(),closedBy:settings.treasurer||''};await put('closures',c);await audit('close','month',month,c);await renderClosures();toast('Mes cerrado')}async function renderClosures(){const cs=(await all('closures')).sort((a,b)=>b.month.localeCompare(a.month));$('closureList').innerHTML=cs.map(c=>`<div class="item"><div><div class="item-title">${esc(c.month)}</div><div class="item-sub">Cerrado ${new Date(c.closedAt).toLocaleDateString('es-DO')} · ${esc(c.closedBy)}</div></div><div><div class="amount income" data-money>${money(c.closing)}</div><span class="badge">Inicial ${money(c.opening)} · +${money(c.income)} · -${money(c.expense)}</span></div></div>`).join('')||'<div class="empty">Todavía no hay cierres</div>'}
 async function renderReport(){const from=$('reportFrom').value||'0000-01-01',to=$('reportTo').value||'9999-12-31',list=(await all('transactions')).filter(m=>m.status!=='void'&&m.date>=from&&m.date<=to),t=totals(list);$('reportPreview').classList.add('print-target');$('reportPreview').innerHTML=`<h3>Informe Financiero – ${esc(settings.organization||'Junta de Vecinos')}</h3><p>Período: ${$('reportFrom').value?dateText($('reportFrom').value):'Todos los registros'} ${$('reportTo').value?'al '+dateText($('reportTo').value):''}</p><table><tr><th>Concepto</th><th>Monto</th></tr><tr><td>Ingresos</td><td>${money(t.income)}</td></tr><tr><td>Gastos</td><td>${money(t.expense)}</td></tr><tr><td>Patrocinados</td><td>${money(t.sponsored)}</td></tr><tr><th>Balance del período</th><th>${money(t.income-t.expense)}</th></tr></table><h4>Movimientos</h4><table>${list.map(x=>`<tr><td>${dateText(x.date)} · ${esc(x.person)} · ${esc(x.concept)}</td><td>${money(x.amount)}</td></tr>`).join('')||'<tr><td colspan="2">Sin movimientos</td></tr>'}</table><p class="muted">Los aportes directos no se consideran dinero que entra a caja.</p>`}
+
+async function importLegacyData(legacy,{replace=false}={}){
+  if(!legacy || typeof legacy!=='object') throw new Error('legacy-invalid');
+
+  if(replace){
+    for(const s of ['members','transactions','activities','dues','closures','audit']){
+      for(const x of await all(s)) await del(s,x.id);
+    }
+  }
+
+  // Settings/meta
+  if(legacy.meta){
+    await saveSettings({
+      organization: legacy.meta.organization || settings.organization || 'Junta de Vecinos',
+      treasurer: legacy.meta.treasurer || settings.treasurer || '',
+      dueAmount: +settings.dueAmount || 200
+    });
+  }
+
+  // Members: merge by normalized name.
+  const existingMembers = await all('members');
+  const byName = new Map(existingMembers.map(m=>[normName(m.name),m]));
+  for(const lm of legacy.members||[]){
+    const name=String(lm.name||'').trim().replace(/\s+/g,' ');
+    if(!name) continue;
+    const key=normName(name);
+    const ex=byName.get(key);
+    if(ex){
+      ex.phone = ex.phone || lm.phone || '';
+      ex.status = ex.status || lm.status || 'active';
+      await put('members',ex);
+    }else{
+      const m={id:lm.id||uid('m'),name,phone:lm.phone||'',status:lm.status||'active'};
+      await put('members',m);byName.set(key,m);
+    }
+  }
+
+  // Activities: merge by normalized name + date.
+  const existingActs=await all('activities');
+  const actKey=a=>`${normName(a.name)}|${a.date||''}`;
+  const acts=new Map(existingActs.map(a=>[actKey(a),a]));
+  for(const la of legacy.activities||[]){
+    if(!la.name) continue;
+    const k=actKey(la);
+    if(!acts.has(k)){
+      const a={id:la.id||uid('a'),name:la.name,date:la.date||nowDate(),budget:+la.budget||0,description:la.description||''};
+      await put('activities',a);acts.set(k,a);
+    }
+  }
+
+  // Movements/transactions: merge by ID first, then signature.
+  const legacyTx=legacy.movements||legacy.transactions||[];
+  const existingTx=await all('transactions');
+  const sig=t=>`${t.date||''}|${normName(t.person)}|${+t.amount||0}|${normName(t.concept)}`;
+  const txById=new Map(existingTx.map(t=>[t.id,t]));
+  const txSigs=new Set(existingTx.map(sig));
+  for(const lt of legacyTx){
+    const signature=sig(lt);
+    if((lt.id && txById.has(lt.id)) || txSigs.has(signature)) continue;
+    const t={
+      ...lt,
+      id:lt.id||uid('t'),
+      category:lt.category || (lt.type==='income'?'Aporte':'Otro'),
+      receiptNo:lt.receiptNo||'',
+      receiptGenerated:!!lt.receiptNo,
+      memberId:lt.memberId||'',
+      status:lt.status||'active',
+      createdAt:lt.createdAt||new Date().toISOString(),
+      updatedAt:new Date().toISOString()
+    };
+    await put('transactions',t);
+    txSigs.add(signature);
+  }
+
+  // Old audit is optional.
+  for(const a of legacy.audit||[]){
+    if(a?.id && !(await get('audit',a.id))) await put('audit',a);
+  }
+
+  await repairMemberDuplicates();
+  await repairTransactionMemberLinks();
+
+  // Rebuild dues for current month if members exist and there are none.
+  const members=(await all('members')).filter(m=>m.status==='active');
+  const currentDues=(await all('dues')).filter(d=>d.month===ym());
+  if(members.length && !currentDues.length && (+settings.dueAmount||0)>0){
+    await generateDues(ym());
+  }
+
+  await audit('import','legacy','v2',{members:(legacy.members||[]).length,transactions:legacyTx.length,activities:(legacy.activities||[]).length,at:new Date().toISOString()});
+  await renderAll();
+}
+
+function isV3Backup(d){
+  return d && Number(d.version)>=3 && Array.isArray(d.members) && Array.isArray(d.transactions);
+}
+function isLegacyBackup(d){
+  return d && !d.version && Array.isArray(d.members) && (Array.isArray(d.movements)||Array.isArray(d.transactions));
+}
+
+async function restoreCompatibleBackup(d){
+  if(isV3Backup(d)){
+    await restoreAll(d);
+    await repairMemberDuplicates();
+    await repairTransactionMemberLinks();
+    await renderAll();
+    return 'Respaldo v3 restaurado';
+  }
+  if(isLegacyBackup(d)){
+    await importLegacyData(d,{replace:false});
+    return 'Respaldo anterior importado y convertido';
+  }
+  throw new Error('backup-format-unsupported');
+}
+
+async function recoverLegacyFromDevice(){
+  const raw=localStorage.getItem('juntaTreasury_v1');
+  if(!raw) throw new Error('legacy-not-found');
+  const legacy=JSON.parse(raw);
+  if(!isLegacyBackup(legacy) && !(legacy.members||legacy.movements||legacy.activities)) throw new Error('legacy-invalid');
+  await importLegacyData(legacy,{replace:false});
+}
+
 async function exportAll(){return{version:3,exportedAt:new Date().toISOString(),settings:await get('settings','main'),members:await all('members'),transactions:await all('transactions'),activities:await all('activities'),dues:await all('dues'),closures:await all('closures'),audit:await all('audit')}}async function restoreAll(d){for(const s of ['members','transactions','activities','dues','closures','audit'])for(const x of await all(s))await del(s,x.id);for(const s of ['members','transactions','activities','dues','closures','audit'])for(const x of d[s]||[])await put(s,x);if(d.settings)await put('settings',{...d.settings,id:'main'});await loadSettings();await renderAll()}function downloadBlob(blob,name){const a=document.createElement('a');a.href=URL.createObjectURL(blob);a.download=name;a.click();setTimeout(()=>URL.revokeObjectURL(a.href),500)}
 $('generateDuesBtn').onclick=()=>generateDues();$('duesMonth').onchange=renderDues;$('duesStatusFilter').onchange=renderDues;$('closeMonthBtn').onclick=closeMonth;$('refreshReportBtn').onclick=renderReport;$('reportFrom').onchange=renderReport;$('reportTo').onchange=renderReport;$('printReportBtn').onclick=()=>window.print();$('shareReportBtn').onclick=async()=>{const txt=$('reportPreview').innerText;if(navigator.share)await navigator.share({title:'Informe financiero',text:txt});else{await navigator.clipboard.writeText(txt);toast('Informe copiado')}};$('exportCsvBtn').onclick=async()=>{const tx=await all('transactions'),rows=[['Fecha','Tipo','Persona','Monto','Concepto','Categoria','Metodo','Recibo','Estado'],...tx.map(m=>[m.date,ml(m.type),m.person,m.amount,m.concept,m.category,m.method,m.receiptNo,m.status])],csv=rows.map(r=>r.map(v=>`"${String(v??'').replaceAll('"','""')}"`).join(',')).join('\n');downloadBlob(new Blob(['\ufeff'+csv],{type:'text/csv'}),'tesoreria_movimientos.csv')}
-$('backupBtn').onclick=async()=>{downloadBlob(new Blob([JSON.stringify(await exportAll(),null,2)],{type:'application/json'}),`respaldo_tesoreria_${nowDate()}.json`);await saveSettings({lastBackupAt:new Date().toISOString()});await renderDashboard();toast('Respaldo exportado')};$('restoreInput').onchange=async e=>{const f=e.target.files[0];if(!f)return;try{const d=JSON.parse(await f.text());if(!d.version)throw Error();await restoreAll(d);toast('Respaldo restaurado')}catch(err){alert('Respaldo inválido')}e.target.value=''};$('resetBtn').onclick=()=>{if(confirm('¿Borrar TODOS los datos locales?')){indexedDB.deleteDatabase(DB_NAME);localStorage.clear();location.reload()}};$('saveSettingsBtn').onclick=async e=>{e.preventDefault();await saveSettings({organization:$('settingOrg').value.trim(),treasurer:$('settingTreasurer').value.trim(),dueAmount:+$('settingDueAmount').value||0,pin:$('settingPin').value.trim()});toast('Configuración guardada');await renderAll()};$('privacyBtn').onclick=()=>{privacy=!privacy;document.body.classList.toggle('money-hidden',privacy);$('privacyBtn').textContent=privacy?'🙈':'👁️'};$('closeReceiptBtn').onclick=()=>$('receiptDialog').close();$('closeDetailBtn').onclick=()=>$('detailDialog').close();$('printReceiptBtn').onclick=()=>window.print();$('shareReceiptBtn').onclick=async()=>{if(!currentReceipt)return;const txt=$('receiptBody').innerText;if(navigator.share)await navigator.share({title:`Recibo ${currentReceipt.receiptNo}`,text:txt});else{await navigator.clipboard.writeText(txt);toast('Recibo copiado')}};$('quickReceiptBtn').onclick=async()=>{const tx=(await all('transactions')).filter(x=>x.receiptNo).sort((a,b)=>b.date.localeCompare(a.date));if(!tx.length){toast('Aún no hay recibos');return}showReceipt(tx[0].id)};$('movementTypeFilter').onchange=renderMovements;$('movementSearch').oninput=renderMovements;$('memberSearch').oninput=renderMembers;
+$('backupBtn').onclick=async()=>{downloadBlob(new Blob([JSON.stringify(await exportAll(),null,2)],{type:'application/json'}),`respaldo_tesoreria_${nowDate()}.json`);await saveSettings({lastBackupAt:new Date().toISOString()});await renderDashboard();toast('Respaldo exportado')};$('restoreInput').onchange=async e=>{
+  const f=e.target.files[0];if(!f)return;
+  try{
+    const d=JSON.parse(await f.text());
+    const msg=await restoreCompatibleBackup(d);
+    toast(msg);
+  }catch(err){
+    console.error(err);
+    alert('No pude reconocer este respaldo. Si fue creado por la versión anterior, usa también "Recuperar datos de versión anterior".');
+  }
+  e.target.value=''
+};
+
+$('recoverLegacyBtn').onclick=async()=>{
+  try{
+    await recoverLegacyFromDevice();
+    toast('Datos anteriores recuperados');
+  }catch(err){
+    console.error(err);
+    if(err.message==='legacy-not-found') alert('No encontré datos de la versión anterior en este navegador. Usa Restaurar respaldo y selecciona tu archivo JSON anterior.');
+    else alert('Encontré datos anteriores, pero no pude convertirlos automáticamente.');
+  }
+};
+$('resetBtn').onclick=()=>{if(confirm('¿Borrar TODOS los datos locales?')){indexedDB.deleteDatabase(DB_NAME);localStorage.clear();location.reload()}};$('saveSettingsBtn').onclick=async e=>{e.preventDefault();await saveSettings({organization:$('settingOrg').value.trim(),treasurer:$('settingTreasurer').value.trim(),dueAmount:+$('settingDueAmount').value||0,pin:$('settingPin').value.trim()});toast('Configuración guardada');await renderAll()};$('privacyBtn').onclick=()=>{privacy=!privacy;document.body.classList.toggle('money-hidden',privacy);$('privacyBtn').textContent=privacy?'🙈':'👁️'};$('closeReceiptBtn').onclick=()=>$('receiptDialog').close();$('closeDetailBtn').onclick=()=>$('detailDialog').close();$('printReceiptBtn').onclick=()=>window.print();$('shareReceiptBtn').onclick=async()=>{if(!currentReceipt)return;const txt=$('receiptBody').innerText;if(navigator.share)await navigator.share({title:`Recibo ${currentReceipt.receiptNo}`,text:txt});else{await navigator.clipboard.writeText(txt);toast('Recibo copiado')}};$('quickReceiptBtn').onclick=async()=>{const tx=(await all('transactions')).filter(x=>x.receiptNo).sort((a,b)=>b.date.localeCompare(a.date));if(!tx.length){toast('Aún no hay recibos');return}showReceipt(tx[0].id)};$('movementTypeFilter').onchange=renderMovements;$('movementSearch').oninput=renderMovements;$('memberSearch').oninput=renderMembers;
 async function renderSettings(){$('settingOrg').value=settings.organization||'';$('settingTreasurer').value=settings.treasurer||'';$('settingDueAmount').value=settings.dueAmount||200;$('settingPin').value=settings.pin||''}async function renderAll(){await loadSettings();await Promise.all([fillActivities(),renderDashboard(),renderMovements(),renderMembers(),renderActivities(),renderDues(),renderClosures(),renderSettings()]);if(document.querySelector('.view.active')?.id==='reports')await renderReport()}async function setup(){if((await get('settings','main'))?.organization)return;return new Promise(r=>{$('setupDialog').showModal();$('finishSetupBtn').onclick=async e=>{e.preventDefault();if(!$('setupForm').reportValidity())return;await saveSettings({organization:$('setupOrg').value.trim(),treasurer:$('setupTreasurer').value.trim(),dueAmount:+$('setupDueAmount').value||0,pin:$('setupPin').value.trim(),createdAt:new Date().toISOString()});$('setupDialog').close();r()}})}async function unlockIfNeeded(){if(!settings.pin)return;$('pinDialog').showModal();$('unlockBtn').onclick=e=>{e.preventDefault();if($('pinInput').value===settings.pin){$('pinDialog').close();$('pinInput').value=''}else toast('PIN incorrecto')}}let deferredPrompt=null;window.addEventListener('beforeinstallprompt',e=>{e.preventDefault();deferredPrompt=e;$('installBtn').classList.remove('hidden')});$('installBtn').onclick=async()=>{if(!deferredPrompt)return;deferredPrompt.prompt();await deferredPrompt.userChoice;deferredPrompt=null;$('installBtn').classList.add('hidden')};$('closeMemberProfileBtn').onclick=()=>$('memberProfileDialog').close();$('profileEditMemberBtn').onclick=()=>{const id=currentProfileMemberId;$('memberProfileDialog').close();if(id)editMember(id)};$('profileAddContributionBtn').onclick=async()=>{const m=await get('members',currentProfileMemberId);if(!m)return;$('memberProfileDialog').close();await openMovement('income');$('movementPerson').value=m.name;$('movementConcept').value='Aporte al fondo de la Junta';$('movementCategory').value='Aporte';$('movementGenerateReceipt').checked=true};
 (async()=>{dbi=await openDB();await migrateLegacy();await loadSettings();await setup();await loadSettings();$('duesMonth').value=ym();await renderAll();await unlockIfNeeded();if('serviceWorker'in navigator)navigator.serviceWorker.register('./sw.js').catch(()=>{})})();
