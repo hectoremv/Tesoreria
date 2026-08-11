@@ -1,0 +1,1 @@
+v3.3: corrige lista de miembros, agrega ficha completa, vincula movimientos a memberId, mejora renombrado e historial. Reemplaza todos los archivos en GitHub Pages sin borrar datos del navegador.
