@@ -218,19 +218,99 @@ function isLegacyBackup(d){
   return d && !d.version && Array.isArray(d.members) && (Array.isArray(d.movements)||Array.isArray(d.transactions));
 }
 
+
+function normalizeBackupShape(d){
+  if(!d || typeof d!=='object') throw new Error('El archivo no contiene un objeto JSON válido.');
+  const tx = Array.isArray(d.transactions) ? d.transactions : (Array.isArray(d.movements) ? d.movements : []);
+  if(!Array.isArray(d.members) || !Array.isArray(tx)) throw new Error('El respaldo no contiene las colecciones members y transactions/movements.');
+
+  const groups=new Map();
+  for(const m of d.members){
+    const name=String(m?.name||'').trim().replace(/\s+/g,' ');
+    if(!name) continue;
+    const k=normName(name);
+    if(!groups.has(k)) groups.set(k,[]);
+    groups.get(k).push({...m,name});
+  }
+
+  const members=[], oldToNew=new Map(), nameToMember=new Map();
+  for(const [k,g] of groups){
+    g.sort((a,b)=>{
+      const ap=a.phone?1:0,bp=b.phone?1:0;if(bp!==ap)return bp-ap;
+      const as=/^m\d+$/.test(String(a.id||''))?1:0,bs=/^m\d+$/.test(String(b.id||''))?1:0;if(bs!==as)return bs-as;
+      return String(a.id||'').localeCompare(String(b.id||''));
+    });
+    const keep={...g[0],id:g[0].id||uid('m'),status:g.some(x=>x.status==='active')?'active':(g[0].status||'active')};
+    if(!keep.phone) keep.phone=g.find(x=>x.phone)?.phone||'';
+    members.push(keep);nameToMember.set(k,keep);
+    for(const x of g) if(x.id) oldToNew.set(x.id,keep.id);
+  }
+
+  const transactions=tx.map(x=>{
+    const t={...x};
+    const byId=t.memberId?members.find(m=>m.id===oldToNew.get(t.memberId)||m.id===t.memberId):null;
+    const byName=nameToMember.get(normName(t.person));
+    const m=byId||byName;
+    if(m){t.memberId=m.id;t.person=m.name}else t.memberId=t.memberId||'';
+    t.id=t.id||uid('t');t.status=t.status||'active';t.category=t.category||(t.type==='income'?'Aporte':'Otro');
+    t.receiptNo=t.receiptNo||'';t.receiptGenerated=!!t.receiptNo;t.createdAt=t.createdAt||new Date().toISOString();
+    return t;
+  });
+
+  const dueMap=new Map();
+  for(const x of Array.isArray(d.dues)?d.dues:[]){
+    const q={...x};q.memberId=oldToNew.get(q.memberId)||q.memberId;
+    const m=members.find(mm=>mm.id===q.memberId)||nameToMember.get(normName(q.memberName));
+    if(m){q.memberId=m.id;q.memberName=m.name}
+    const key=`${q.month||''}|${q.memberId||''}`;
+    if(dueMap.has(key)){
+      const e=dueMap.get(key);e.amountDue=Math.max(+e.amountDue||0,+q.amountDue||0);e.amountPaid=Math.max(+e.amountPaid||0,+q.amountPaid||0);
+      e.status=e.amountPaid>=e.amountDue?'paid':e.amountPaid>0?'partial':'pending';
+    }else{q.id=`due_${q.month}_${q.memberId}`;dueMap.set(key,q)}
+  }
+
+  return {
+    version:4,
+    settings:d.settings||d.meta||{},
+    members,
+    transactions,
+    activities:Array.isArray(d.activities)?d.activities:[],
+    dues:[...dueMap.values()],
+    closures:Array.isArray(d.closures)?d.closures:[],
+    audit:Array.isArray(d.audit)?d.audit:[]
+  };
+}
+
 async function restoreCompatibleBackup(d){
-  if(isV3Backup(d)){
-    await restoreAll(d);
-    await repairMemberDuplicates();
-    await repairTransactionMemberLinks();
-    await renderAll();
-    return 'Respaldo v3 restaurado';
+  const n=normalizeBackupShape(d);
+
+  // Write in a deterministic order. No render until all records exist.
+  for(const s of ['members','transactions','activities','dues','closures','audit']){
+    for(const x of await all(s)) await del(s,x.id);
   }
-  if(isLegacyBackup(d)){
-    await importLegacyData(d,{replace:false});
-    return 'Respaldo anterior importado y convertido';
-  }
-  throw new Error('backup-format-unsupported');
+
+  for(const m of n.members) await put('members',m);
+  for(const a of n.activities) await put('activities',{budget:0,description:'',...a});
+  for(const t of n.transactions) await put('transactions',t);
+  for(const q of n.dues) await put('dues',q);
+  for(const c of n.closures) await put('closures',c);
+  for(const a of n.audit) if(a?.id) await put('audit',a);
+
+  if(n.settings) await put('settings',{...n.settings,id:'main'});
+  await loadSettings();
+
+  // Repair member links one last time after every table is loaded.
+  await repairMemberDuplicates();
+  await repairTransactionMemberLinks();
+
+  const memberCount=(await all('members')).length;
+  const txCount=(await all('transactions')).length;
+  const activityCount=(await all('activities')).length;
+  if(!memberCount) throw new Error('La restauración terminó sin miembros; se canceló la validación.');
+
+  await audit('restore','backup','compatible',{members:memberCount,transactions:txCount,activities:activityCount,at:new Date().toISOString()});
+  await renderAll();
+  return `Respaldo restaurado: ${memberCount} miembros, ${txCount} movimientos y ${activityCount} actividad(es).`;
 }
 
 async function recoverLegacyFromDevice(){
@@ -241,7 +321,7 @@ async function recoverLegacyFromDevice(){
   await importLegacyData(legacy,{replace:false});
 }
 
-async function exportAll(){return{version:3,exportedAt:new Date().toISOString(),settings:await get('settings','main'),members:await all('members'),transactions:await all('transactions'),activities:await all('activities'),dues:await all('dues'),closures:await all('closures'),audit:await all('audit')}}async function restoreAll(d){for(const s of ['members','transactions','activities','dues','closures','audit'])for(const x of await all(s))await del(s,x.id);for(const s of ['members','transactions','activities','dues','closures','audit'])for(const x of d[s]||[])await put(s,x);if(d.settings)await put('settings',{...d.settings,id:'main'});await loadSettings();await renderAll()}function downloadBlob(blob,name){const a=document.createElement('a');a.href=URL.createObjectURL(blob);a.download=name;a.click();setTimeout(()=>URL.revokeObjectURL(a.href),500)}
+async function exportAll(){return{format:'tesoreria-junta',version:4,schemaVersion:4,exportedAt:new Date().toISOString(),settings:await get('settings','main'),members:await all('members'),transactions:await all('transactions'),activities:await all('activities'),dues:await all('dues'),closures:await all('closures'),audit:await all('audit')}}async function restoreAll(d){for(const s of ['members','transactions','activities','dues','closures','audit'])for(const x of await all(s))await del(s,x.id);for(const s of ['members','transactions','activities','dues','closures','audit'])for(const x of d[s]||[])await put(s,x);if(d.settings)await put('settings',{...d.settings,id:'main'});await loadSettings();await renderAll()}function downloadBlob(blob,name){const a=document.createElement('a');a.href=URL.createObjectURL(blob);a.download=name;a.click();setTimeout(()=>URL.revokeObjectURL(a.href),500)}
 $('generateDuesBtn').onclick=()=>generateDues();$('duesMonth').onchange=renderDues;$('duesStatusFilter').onchange=renderDues;$('closeMonthBtn').onclick=closeMonth;$('refreshReportBtn').onclick=renderReport;$('reportFrom').onchange=renderReport;$('reportTo').onchange=renderReport;$('printReportBtn').onclick=()=>window.print();$('shareReportBtn').onclick=async()=>{const txt=$('reportPreview').innerText;if(navigator.share)await navigator.share({title:'Informe financiero',text:txt});else{await navigator.clipboard.writeText(txt);toast('Informe copiado')}};$('exportCsvBtn').onclick=async()=>{const tx=await all('transactions'),rows=[['Fecha','Tipo','Persona','Monto','Concepto','Categoria','Metodo','Recibo','Estado'],...tx.map(m=>[m.date,ml(m.type),m.person,m.amount,m.concept,m.category,m.method,m.receiptNo,m.status])],csv=rows.map(r=>r.map(v=>`"${String(v??'').replaceAll('"','""')}"`).join(',')).join('\n');downloadBlob(new Blob(['\ufeff'+csv],{type:'text/csv'}),'tesoreria_movimientos.csv')}
 $('backupBtn').onclick=async()=>{downloadBlob(new Blob([JSON.stringify(await exportAll(),null,2)],{type:'application/json'}),`respaldo_tesoreria_${nowDate()}.json`);await saveSettings({lastBackupAt:new Date().toISOString()});await renderDashboard();toast('Respaldo exportado')};$('restoreInput').onchange=async e=>{
   const f=e.target.files[0];if(!f)return;
@@ -251,7 +331,7 @@ $('backupBtn').onclick=async()=>{downloadBlob(new Blob([JSON.stringify(await exp
     toast(msg);
   }catch(err){
     console.error(err);
-    alert('No pude reconocer este respaldo. Si fue creado por la versión anterior, usa también "Recuperar datos de versión anterior".');
+    alert('No se pudo restaurar el respaldo. Detalle: ' + (err?.message || String(err)));
   }
   e.target.value=''
 };
