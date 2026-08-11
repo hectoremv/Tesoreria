@@ -1,0 +1,188 @@
+<!doctype html>
+<html lang="es">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover" />
+  <meta name="theme-color" content="#0f766e" />
+  <meta name="description" content="Tesorería local y offline para Junta de Vecinos" />
+  <link rel="manifest" href="manifest.webmanifest" />
+  <link rel="icon" href="icon-192.png" />
+  <link rel="apple-touch-icon" href="icon-192.png" />
+  <link rel="stylesheet" href="styles.css" />
+  <title>Tesorería de la Junta</title>
+</head>
+<body>
+  <header class="topbar">
+    <div>
+      <div class="eyebrow">Junta de Vecinos</div>
+      <h1>Tesorería</h1>
+    </div>
+    <button id="installBtn" class="ghost hidden">Instalar</button>
+  </header>
+
+  <nav class="tabs" aria-label="Secciones">
+    <button class="tab active" data-view="dashboard">Resumen</button>
+    <button class="tab" data-view="movements">Movimientos</button>
+    <button class="tab" data-view="members">Miembros</button>
+    <button class="tab" data-view="activities">Actividades</button>
+    <button class="tab" data-view="reports">Informes</button>
+    <button class="tab" data-view="settings">Respaldo</button>
+  </nav>
+
+  <main>
+    <section id="dashboard" class="view active">
+      <div class="cards">
+        <article class="card accent"><span>Balance actual</span><strong id="balanceCard">RD$0.00</strong></article>
+        <article class="card"><span>Ingresos al fondo</span><strong id="incomeCard">RD$0.00</strong></article>
+        <article class="card"><span>Gastos del fondo</span><strong id="expenseCard">RD$0.00</strong></article>
+        <article class="card"><span>Aportes directos</span><strong id="sponsoredCard">RD$0.00</strong></article>
+      </div>
+
+      <div class="panel">
+        <div class="panel-head"><h2>Acciones rápidas</h2></div>
+        <div class="quick-actions">
+          <button class="primary" data-open-movement="income">+ Registrar ingreso</button>
+          <button class="danger-soft" data-open-movement="expense">+ Registrar gasto</button>
+          <button class="secondary" data-view-jump="activities">Ver actividades</button>
+        </div>
+      </div>
+
+      <div class="panel">
+        <div class="panel-head"><h2>Últimos movimientos</h2><span id="lastCount" class="muted"></span></div>
+        <div id="latestMovements" class="list"></div>
+      </div>
+    </section>
+
+    <section id="movements" class="view">
+      <div class="panel">
+        <div class="panel-head">
+          <h2>Movimientos</h2>
+          <button class="primary" id="newMovementBtn">+ Nuevo</button>
+        </div>
+        <div class="filters">
+          <select id="movementTypeFilter">
+            <option value="">Todos</option>
+            <option value="income">Ingresos</option>
+            <option value="expense">Gastos</option>
+            <option value="sponsored">Aportes directos</option>
+          </select>
+          <input id="movementSearch" placeholder="Buscar por persona o concepto" />
+        </div>
+        <div id="movementList" class="list"></div>
+      </div>
+    </section>
+
+    <section id="members" class="view">
+      <div class="panel">
+        <div class="panel-head">
+          <h2>Miembros</h2>
+          <button class="primary" id="newMemberBtn">+ Miembro</button>
+        </div>
+        <div id="memberList" class="list"></div>
+      </div>
+    </section>
+
+    <section id="activities" class="view">
+      <div class="panel">
+        <div class="panel-head">
+          <h2>Actividades</h2>
+          <button class="primary" id="newActivityBtn">+ Actividad</button>
+        </div>
+        <div id="activityList" class="list"></div>
+      </div>
+    </section>
+
+    <section id="reports" class="view">
+      <div class="panel">
+        <div class="panel-head"><h2>Informe financiero</h2></div>
+        <div class="report-controls">
+          <label>Desde <input type="date" id="reportFrom"></label>
+          <label>Hasta <input type="date" id="reportTo"></label>
+          <button class="secondary" id="refreshReportBtn">Actualizar</button>
+        </div>
+        <div id="reportPreview" class="report-sheet"></div>
+        <div class="quick-actions">
+          <button class="primary" id="printReportBtn">Imprimir / Guardar PDF</button>
+          <button class="secondary" id="copyReportBtn">Copiar para WhatsApp</button>
+          <button class="secondary" id="exportCsvBtn">Exportar CSV</button>
+        </div>
+      </div>
+    </section>
+
+    <section id="settings" class="view">
+      <div class="panel">
+        <div class="panel-head"><h2>Respaldo y seguridad</h2></div>
+        <p class="muted">Los datos se guardan localmente en este dispositivo. Haz respaldos periódicos.</p>
+        <div class="stack">
+          <button class="primary" id="backupBtn">Exportar respaldo (.json)</button>
+          <label class="file-btn secondary">Restaurar respaldo
+            <input type="file" id="restoreInput" accept="application/json" hidden />
+          </label>
+          <button class="danger-soft" id="resetBtn">Restablecer datos de ejemplo</button>
+        </div>
+        <div class="notice">Importante: desinstalar la app o borrar los datos del navegador puede eliminar la información local si no tienes un respaldo.</div>
+      </div>
+    </section>
+  </main>
+
+  <dialog id="movementDialog">
+    <form method="dialog" id="movementForm">
+      <div class="dialog-head"><h3 id="movementDialogTitle">Nuevo movimiento</h3><button class="icon-btn" value="cancel" aria-label="Cerrar">✕</button></div>
+      <input type="hidden" id="movementId">
+      <label>Tipo
+        <select id="movementType" required>
+          <option value="income">Ingreso al fondo</option>
+          <option value="expense">Gasto del fondo</option>
+          <option value="sponsored">Aporte directo / gasto patrocinado</option>
+        </select>
+      </label>
+      <label>Fecha <input type="date" id="movementDate" required></label>
+      <label>Persona / Responsable <input id="movementPerson" required placeholder="Nombre"></label>
+      <label>Monto <input type="number" id="movementAmount" required min="0.01" step="0.01" inputmode="decimal"></label>
+      <label>Concepto <input id="movementConcept" required placeholder="Ej. aporte mensual"></label>
+      <label>Actividad
+        <select id="movementActivity"><option value="">Sin actividad</option></select>
+      </label>
+      <label>Método
+        <select id="movementMethod">
+          <option>Efectivo</option><option>Transferencia</option><option>Pago directo</option><option>Otro</option>
+        </select>
+      </label>
+      <label>Observación <textarea id="movementNotes" rows="3"></textarea></label>
+      <div class="dialog-actions"><button value="cancel" class="secondary">Cancelar</button><button id="saveMovementBtn" value="default" class="primary">Guardar</button></div>
+    </form>
+  </dialog>
+
+  <dialog id="memberDialog">
+    <form method="dialog" id="memberForm">
+      <div class="dialog-head"><h3>Miembro</h3><button class="icon-btn" value="cancel">✕</button></div>
+      <input type="hidden" id="memberId">
+      <label>Nombre <input id="memberName" required></label>
+      <label>Teléfono <input id="memberPhone" inputmode="tel"></label>
+      <label>Estado
+        <select id="memberStatus"><option value="active">Activo</option><option value="inactive">Inactivo</option></select>
+      </label>
+      <div class="dialog-actions"><button value="cancel" class="secondary">Cancelar</button><button id="saveMemberBtn" value="default" class="primary">Guardar</button></div>
+    </form>
+  </dialog>
+
+  <dialog id="activityDialog">
+    <form method="dialog" id="activityForm">
+      <div class="dialog-head"><h3>Actividad</h3><button class="icon-btn" value="cancel">✕</button></div>
+      <input type="hidden" id="activityId">
+      <label>Nombre <input id="activityName" required></label>
+      <label>Fecha <input type="date" id="activityDate" required></label>
+      <label>Descripción <textarea id="activityDescription" rows="3"></textarea></label>
+      <div class="dialog-actions"><button value="cancel" class="secondary">Cancelar</button><button id="saveActivityBtn" value="default" class="primary">Guardar</button></div>
+    </form>
+  </dialog>
+
+  <dialog id="detailDialog">
+    <div class="dialog-head"><h3>Detalle</h3><button class="icon-btn" id="closeDetailBtn">✕</button></div>
+    <div id="detailBody"></div>
+  </dialog>
+
+  <div id="toast" class="toast" role="status"></div>
+  <script src="app.js"></script>
+</body>
+</html>
